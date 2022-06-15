@@ -36,13 +36,24 @@ static MAXIMUM_NUMBER_OF_RETRIES: u32 = 10;
 ///```
 ///
 pub struct RetryTransientMiddleware<T: RetryPolicy + Send + Sync + 'static> {
+    streaming_passthrough: bool,
     retry_policy: T,
 }
 
 impl<T: RetryPolicy + Send + Sync> RetryTransientMiddleware<T> {
     /// Construct `RetryTransientMiddleware` with  a [retry_policy][retry_policies::RetryPolicy].
     pub fn new_with_policy(retry_policy: T) -> Self {
-        Self { retry_policy }
+        Self { streaming_passthrough: false, retry_policy }
+    }
+
+    /// Enables passing through streaming requests without attempting retries.
+    ///
+    /// Currently retrying a request requires cloning the underlying request in case it fails.
+    /// This does not work when trying to send a streaming request as the body of a streaming
+    /// request can not be cloned.
+    pub fn with_streaming_passthrough(mut self, enabled: bool) -> Self {
+        self.streaming_passthrough = enabled;
+        self
     }
 }
 
@@ -93,46 +104,55 @@ impl<T: RetryPolicy + Send + Sync> RetryTransientMiddleware<T> {
                 Error::Middleware(anyhow!(
                     "Request object is not clonable. Are you passing a streaming body?".to_string()
                 ))
-            })?;
+            });
 
-            let cloned_next = next.clone();
+            // If we failed to clone the request, then check to see if if the client is
+            // configured to pass through streaming requests.
+            // TODO: What kinds of requests are both non-Streaming and non-Clone?
+            if duplicate_request.is_err() && self.streaming_passthrough {
+                next.run(req, ext).await
+            } else {
+                let duplicate_request = duplicate_request?;
 
-            let result = next.run(req, ext).await;
+                let cloned_next = next.clone();
 
-            // We classify the response which will return None if not
-            // errors were returned.
-            match Retryable::from_reqwest_response(&result) {
-                Some(retryable)
-                    if retryable == Retryable::Transient
-                        && n_past_retries < MAXIMUM_NUMBER_OF_RETRIES =>
-                {
-                    // If the response failed and the error type was transient
-                    // we can safely try to retry the request.
-                    let retry_decicion = self.retry_policy.should_retry(n_past_retries);
-                    if let retry_policies::RetryDecision::Retry { execute_after } = retry_decicion {
-                        let duration = (execute_after - Utc::now())
-                            .to_std()
-                            .map_err(Error::middleware)?;
-                        // Sleep the requested amount before we try again.
-                        tracing::warn!(
-                            "Retry attempt #{}. Sleeping {:?} before the next attempt",
-                            n_past_retries,
-                            duration
-                        );
-                        tokio::time::sleep(duration).await;
+                let result = next.run(req, ext).await;
 
-                        self.execute_with_retry_recursive(
-                            duplicate_request,
-                            cloned_next,
-                            ext,
-                            n_past_retries + 1,
-                        )
-                        .await
-                    } else {
-                        result
+                // We classify the response which will return None if not
+                // errors were returned.
+                match Retryable::from_reqwest_response(&result) {
+                    Some(retryable)
+                        if retryable == Retryable::Transient
+                            && n_past_retries < MAXIMUM_NUMBER_OF_RETRIES =>
+                    {
+                        // If the response failed and the error type was transient
+                        // we can safely try to retry the request.
+                        let retry_decicion = self.retry_policy.should_retry(n_past_retries);
+                        if let retry_policies::RetryDecision::Retry { execute_after } = retry_decicion {
+                            let duration = (execute_after - Utc::now())
+                                .to_std()
+                                .map_err(Error::middleware)?;
+                            // Sleep the requested amount before we try again.
+                            tracing::warn!(
+                                "Retry attempt #{}. Sleeping {:?} before the next attempt",
+                                n_past_retries,
+                                duration
+                            );
+                            tokio::time::sleep(duration).await;
+
+                            self.execute_with_retry_recursive(
+                                duplicate_request,
+                                cloned_next,
+                                ext,
+                                n_past_retries + 1,
+                            )
+                            .await
+                        } else {
+                            result
+                        }
                     }
+                    Some(_) | None => result,
                 }
-                Some(_) | None => result,
             }
         })
     }
